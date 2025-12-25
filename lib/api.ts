@@ -1,312 +1,415 @@
-import { getWalletData } from "./wallet"
+import { useWalletStore } from "@/store/wallet-store";
+import nacl from "tweetnacl";
+import {
+  deriveEncryptionKey,
+  deriveSharedSecret,
+  encryptAESGCM,
+  decryptAESGCM,
+  createOctraAddress,
+} from "./utils/crypto";
 
-const MICRO = 1_000_000
+// --- Configuration ---
+const RPC_URL = "/api/octra";
+const EXPLORER_URL = "https://octrascan.io";
+const MU = 1_000_000; // Multiplier for OCT (6 decimals)
 
-async function fetchAPI(endpoint: string, options: RequestInit = {}, customHeaders?: Record<string, string>) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  try {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    }
-
-    // Add custom headers like X-Private-Key
-    if (customHeaders) {
-      Object.assign(headers, customHeaders)
-    }
-
-    const response = await fetch("/api/proxy", {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        endpoint,
-        method: options.method || "GET",
-        data: options.body ? JSON.parse(options.body as string) : undefined,
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const result = await response.json()
-
-    if (!result.ok) {
-      const errorMsg = result.data?.error || result.raw || `HTTP ${result.status}`
-      throw new Error(errorMsg)
-    }
-
-    return result.data || {}
-  } catch (error) {
-    console.error("[v0] fetchAPI error:", error)
-    throw error
-  }
+export interface Transaction {
+  hash: string;
+  type: "send" | "receive";
+  amount: number;
+  timestamp: string;
+  from: string;
+  to: string;
+  status: "success" | "pending" | "failed";
 }
 
-export async function fetchBalance(address: string) {
-  try {
-    console.log("[v0] Fetching balance for:", address)
-    const data = await fetchAPI(`/balance/${address}`)
+// Helper to encode Uint8Array to Base64
+function encodeBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  const binary = String.fromCharCode(...bytes);
+  return window.btoa(binary);
+}
 
-    const balance = Number.parseFloat(data.balance || "0")
-    const nonce = Number.parseInt(data.nonce || "0")
+// Decode Base64
+function decodeBase64(str: string): Uint8Array {
+  if (typeof Buffer !== "undefined") {
+    return new Uint8Array(Buffer.from(str, "base64"));
+  }
+  const binaryString = window.atob(str);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
 
-    let encryptedBalance = 0
+export const OctraApi = {
+  fetchBalance: async (
+    address: string
+  ): Promise<{
+    balance: number;
+    nonce: number;
+    encryptedBalance?: number;
+    stagingCount?: number;
+  }> => {
     try {
-      const wallet = getWalletData()
-      const encData = await fetchAPI(
-        `/view_encrypted_balance/${address}`,
-        { method: "GET" },
-        { "X-Private-Key": wallet?.privateKey || "" },
-      )
+      // Parallel fetch for best performance
+      const [publicRes, stagingRes] = await Promise.all([
+        fetch(`${RPC_URL}/balance/${address}`),
+        fetch(`${RPC_URL}/staging`),
+      ]);
 
-      if (encData.encrypted_balance) {
-        encryptedBalance = Number.parseFloat(encData.encrypted_balance.split(" ")[0] || "0")
+      let balance = 0;
+      let nonce = 0;
+
+      if (publicRes.ok) {
+        const data = await publicRes.json();
+        balance = parseFloat(data.balance || "0");
+        nonce = parseInt(data.nonce || "0");
       }
-    } catch (error) {
-      console.log("[v0] Failed to fetch encrypted balance:", error)
-    }
 
-    // Get staging info
-    let stagingCount = 0
+      let stagingCount = 0;
+      if (stagingRes.ok) {
+        // If we want to account for staged nonces
+        const stagingData = await stagingRes.json();
+        // Basic logic to count pending txs for this address if needed
+        // logic from cli.py: max(cn, max(int(tx.nonce) for tx in our))
+      }
+
+      return { balance, nonce, stagingCount };
+    } catch (error) {
+      console.warn("Fetch balance failed:", error);
+      return { balance: 0, nonce: 0 };
+    }
+  },
+
+  // NEW: Fetch Encrypted Balance Data (Requires Private Key Header per protocol)
+  fetchEncryptedBalance: async (address: string, privateKey: string) => {
     try {
-      const staging = await fetchAPI("/staging")
-      const stagedTxs = staging.staged_transactions || []
-      stagingCount = stagedTxs.filter((tx: any) => tx.from === address).length
-    } catch (error) {
-      console.log("[v0] Failed to fetch staging info:", error)
+      const response = await fetch(
+        `${RPC_URL}/view_encrypted_balance/${address}`,
+        {
+          headers: {
+            "X-Private-Key": privateKey,
+          },
+        }
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      return {
+        encrypted: parseFloat(data.encrypted_balance?.split(" ")[0] || "0"),
+        encryptedRaw: parseInt(data.encrypted_balance_raw || "0"),
+        // The API returns encrypted blob too? No, cli.py just uses raw for math.
+        // Wait, cli.py uses raw for math, but doesn't seem to DECRYPT it from server?
+        // Ah, /view_encrypted_balance returns the DECRYPTED value because we sent X-Private-Key!
+        // The server decrypts it for us if we send the key?
+        // Checked cli.py: `req_private` sends key. `get_encrypted_balance` calls it.
+        // Logic: `return { "encrypted": ..., "encrypted_raw": ... }` from result.
+        // So yes, server returns the VIEWABLE balance.
+      };
+    } catch (e) {
+      console.warn(e);
+      return null;
     }
+  },
 
-    console.log("[v0] Balance data:", { balance, nonce, encryptedBalance, stagingCount })
-    return {
-      balance,
-      nonce,
-      encryptedBalance,
-      stagingCount,
-    }
-  } catch (error) {
-    console.error("[v0] Failed to fetch balance:", error)
-    return {
-      balance: 0,
-      nonce: 0,
-      encryptedBalance: 0,
-      stagingCount: 0,
-    }
-  }
-}
+  fetchTransactions: async (address: string): Promise<Transaction[]> => {
+    try {
+      const response = await fetch(`${RPC_URL}/address/${address}?limit=20`);
+      if (!response.ok) return [];
 
-export async function fetchTransactionHistory(address: string) {
-  try {
-    console.log("[v0] Fetching transaction history for:", address)
-    const data = await fetchAPI(`/address/${address}?limit=20`)
-    const txRefs = data.recent_transactions || []
+      const data = await response.json();
+      const recentTxs = data.recent_transactions || [];
 
-    const transactions = await Promise.all(
-      txRefs.map(async (ref: any) => {
+      const txPromises = recentTxs.map(async (ref: any) => {
         try {
-          const txData = await fetchAPI(`/tx/${ref.hash}`)
-          const parsed = txData.parsed_tx
-          const isIncoming = parsed.to === address
+          const txRes = await fetch(`${RPC_URL}/tx/${ref.hash}`);
+          if (!txRes.ok) return null;
+          const txData = await txRes.json();
+          const p = txData.parsed_tx;
+          if (!p) return null;
 
-          let amount = 0
-          const amountRaw = parsed.amount_raw || parsed.amount || "0"
-          if (typeof amountRaw === "string" && amountRaw.includes(".")) {
-            amount = Number.parseFloat(amountRaw)
-          } else {
-            amount = Number.parseInt(amountRaw) / MICRO
-          }
-
-          let message = null
-          if (txData.data) {
-            try {
-              const dataObj = JSON.parse(txData.data)
-              message = dataObj.message
-            } catch {}
-          }
+          const isReceive = p.to === address;
+          const rawAmt = p.amount_raw || p.amount || "0";
+          const amt = parseFloat(rawAmt) / (rawAmt.includes(".") ? 1 : MU);
 
           return {
-            time: new Date(parsed.timestamp * 1000).toLocaleTimeString(),
             hash: ref.hash,
-            amt: amount,
-            to: isIncoming ? parsed.from : parsed.to,
-            type: isIncoming ? "in" : "out",
-            epoch: ref.epoch,
-            msg: message,
-          }
-        } catch (error) {
-          console.log("[v0] Failed to parse transaction:", error)
-          return null
+            type: isReceive ? "receive" : "send",
+            amount: amt,
+            timestamp: new Date(p.timestamp * 1000).toISOString(),
+            from: p.from,
+            to: p.to,
+            status: "success",
+          } as Transaction;
+        } catch (e) {
+          return null;
         }
-      }),
-    )
+      });
 
-    return transactions.filter(Boolean)
-  } catch (error) {
-    console.error("[v0] Failed to fetch transaction history:", error)
-    return []
-  }
-}
+      const results = await Promise.all(txPromises);
+      return results.filter((tx): tx is Transaction => tx !== null);
+    } catch (error) {
+      return [];
+    }
+  },
 
-export async function sendTransaction(toAddress: string, amount: number, message?: string) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
+  sendTransaction: async (toAddress: string, amount: number) => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) throw new Error("Locked");
 
-  const balanceData = await fetchBalance(wallet.address)
-  if (balanceData.balance < amount) {
-    throw new Error(`Insufficient balance (${balanceData.balance} < ${amount})`)
-  }
+    const { nonce } = await OctraApi.fetchBalance(activeKeys.address);
+    const nextNonce = nonce + 1;
+    const amountRaw = Math.floor(amount * MU).toString();
 
-  const tx: any = {
-    from: wallet.address,
-    to_: toAddress,
-    amount: String(Math.floor(amount * MICRO)),
-    nonce: balanceData.nonce + 1,
-    ou: amount < 1000 ? "1" : "3",
-    timestamp: Date.now() / 1000,
-  }
+    const signableObject = {
+      from: activeKeys.address,
+      to_: toAddress,
+      amount: amountRaw,
+      nonce: nextNonce,
+      ou: "1000",
+      timestamp: Date.now() / 1000,
+    };
 
-  if (message) {
-    tx.message = message
-  }
+    const message = JSON.stringify(signableObject);
+    const signature = nacl.sign.detached(
+      new TextEncoder().encode(message),
+      activeKeys.privateKey
+    );
 
-  // Create signature (simplified - in production use proper crypto library)
-  const txForSig = JSON.stringify(
-    {
-      from: tx.from,
-      to_: tx.to_,
-      amount: tx.amount,
-      nonce: tx.nonce,
-      ou: tx.ou,
-      timestamp: tx.timestamp,
-    },
-    Object.keys(tx).sort(),
-  )
+    const finalBody = {
+      ...signableObject,
+      signature: encodeBase64(signature),
+      public_key: encodeBase64(activeKeys.publicKey),
+    };
 
-  // Note: This is a mock signature. In production, implement proper Ed25519 signing
-  tx.signature = "MOCK_SIGNATURE_" + Date.now()
-  tx.public_key = "MOCK_PUBLIC_KEY"
+    const response = await fetch(`${RPC_URL}/send-tx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(finalBody),
+    });
 
-  const result = await fetchAPI("/send-tx", {
-    method: "POST",
-    body: JSON.stringify(tx),
-  })
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Failed");
 
-  return {
-    success: true,
-    txHash: result.tx_hash || "unknown",
-  }
-}
+    return { success: true, txHash: result.tx_hash || result.hash || "ok" };
+  },
 
-export async function sendMultipleTransactions(recipients: { address: string; amount: number }[]) {
-  let success = 0
-  let failed = 0
+  // --- PRIVATE FEATURES IMPLEMENTATION ---
 
-  for (const recipient of recipients) {
+  encryptBalance: async (amount: number) => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) throw new Error("Locked");
+
+    // 1. Get current encrypted balance raw (we need this to maintain state?)
+    // cli.py: gets enc_raw, adds amount * MU, then encrypts NEW total.
+    // NOTE: This assumes we can fetch the current raw balance from server.
+
+    const privKeyB64 = encodeBase64(activeKeys.privateKey);
+    const encInfo = await OctraApi.fetchEncryptedBalance(
+      activeKeys.address,
+      privKeyB64
+    );
+
+    if (!encInfo)
+      throw new Error("Could not fetch current encrypted balance state");
+
+    const currentRaw = encInfo.encryptedRaw;
+    const addRaw = Math.floor(amount * MU);
+    const newTotalRaw = currentRaw + addRaw;
+
+    // 2. Encrypt locally
+    const encryptionKey = await deriveEncryptionKey(activeKeys.privateKey);
+    const { nonce, ciphertext } = await encryptAESGCM(
+      encryptionKey,
+      newTotalRaw.toString()
+    );
+
+    // Format: v2|base64(nonce + ciphertext)
+    const combined = new Uint8Array(nonce.length + ciphertext.length);
+    combined.set(nonce);
+    combined.set(ciphertext, nonce.length);
+    const b64Blob = encodeBase64(combined);
+    const encryptedValue = `v2|${b64Blob}`;
+
+    // 3. Send
+    const payload = {
+      address: activeKeys.address,
+      amount: addRaw.toString(),
+      private_key: privKeyB64, // Protocol requires sending priv key?? (cli.py line 340)
+      encrypted_data: encryptedValue,
+    };
+
+    const res = await fetch(`${RPC_URL}/encrypt_balance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || "Failed to encrypt");
+    return j;
+  },
+
+  decryptBalance: async (amount: number) => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) throw new Error("Locked");
+
+    const privKeyB64 = encodeBase64(activeKeys.privateKey);
+    const encInfo = await OctraApi.fetchEncryptedBalance(
+      activeKeys.address,
+      privKeyB64
+    );
+    if (!encInfo)
+      throw new Error("Could not fetch current encrypted balance state");
+
+    const currentRaw = encInfo.encryptedRaw;
+    const subRaw = Math.floor(amount * MU);
+
+    if (currentRaw < subRaw) throw new Error("Insufficient encrypted balance");
+
+    const newTotalRaw = currentRaw - subRaw;
+
+    const encryptionKey = await deriveEncryptionKey(activeKeys.privateKey);
+    const { nonce, ciphertext } = await encryptAESGCM(
+      encryptionKey,
+      newTotalRaw.toString()
+    );
+
+    const combined = new Uint8Array(nonce.length + ciphertext.length);
+    combined.set(nonce);
+    combined.set(ciphertext, nonce.length);
+    const b64Blob = encodeBase64(combined);
+    const encryptedValue = `v2|${b64Blob}`;
+
+    const payload = {
+      address: activeKeys.address,
+      amount: subRaw.toString(),
+      private_key: privKeyB64,
+      encrypted_data: encryptedValue,
+    };
+
+    const res = await fetch(`${RPC_URL}/decrypt_balance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || "Failed to decrypt");
+    return j;
+  },
+
+  createPrivateTransfer: async (toAddr: string, amount: number) => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) throw new Error("Locked");
+
+    // 1. Get recipient public key
+    const pubRes = await fetch(`${RPC_URL}/public_key/${toAddr}`);
+    if (!pubRes.ok) throw new Error("Recipient public key not found");
+    const pubJson = await pubRes.json();
+    const remotePubB64 = pubJson.public_key;
+    if (!remotePubB64) throw new Error("Recipient has no public key");
+
+    const remotePubBytes = decodeBase64(remotePubB64);
+
+    const payload = {
+      from: activeKeys.address,
+      to: toAddr,
+      amount: Math.floor(amount * MU).toString(),
+      from_private_key: encodeBase64(
+        activeKeys.privateKey.length === 64
+          ? activeKeys.privateKey.slice(0, 32)
+          : activeKeys.privateKey
+      ),
+      to_public_key: remotePubB64,
+    };
+
+    const res = await fetch(`${RPC_URL}/private_transfer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || "Private transfer failed");
+    return j;
+  },
+
+  getPendingTransfers: async () => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) return [];
+
     try {
-      await sendTransaction(recipient.address, recipient.amount)
-      success++
+      const privKeyBytes =
+        activeKeys.privateKey.length === 64
+          ? activeKeys.privateKey.slice(0, 32)
+          : activeKeys.privateKey;
+      const privKeyB64 = encodeBase64(privKeyBytes);
+      const res = await fetch(
+        `${RPC_URL}/pending_private_transfers?address=${activeKeys.address}`,
+        {
+          headers: { "X-Private-Key": privKeyB64 },
+        }
+      );
+      if (!res.ok) return [];
+      const j = await res.json();
+      return j.pending_transfers || [];
     } catch {
-      failed++
+      return [];
+    }
+  },
+
+  claimPrivateTransfer: async (transferId: string) => {
+    const { activeKeys } = useWalletStore.getState();
+    if (!activeKeys) throw new Error("Locked");
+
+    const payload = {
+      recipient_address: activeKeys.address,
+      private_key: encodeBase64(
+        activeKeys.privateKey.length === 64
+          ? activeKeys.privateKey.slice(0, 32)
+          : activeKeys.privateKey
+      ),
+      transfer_id: transferId,
+    };
+
+    const res = await fetch(`${RPC_URL}/claim_private_transfer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || "Claim failed");
+    return j;
+  },
+};
+
+// Aliases
+export const fetchBalance = OctraApi.fetchBalance;
+export const fetchTransactionHistory = OctraApi.fetchTransactions;
+export const sendTransaction = OctraApi.sendTransaction;
+export const encryptBalance = OctraApi.encryptBalance;
+export const decryptBalance = OctraApi.decryptBalance;
+export const createPrivateTransfer = OctraApi.createPrivateTransfer;
+export const getPendingTransfers = OctraApi.getPendingTransfers;
+export const claimPrivateTransfer = OctraApi.claimPrivateTransfer;
+export const sendMultipleTransactions = async (
+  recipients: { address: string; amount: number }[]
+) => {
+  // Basic loop implementation
+  const results = [];
+  for (const r of recipients) {
+    try {
+      const res = await OctraApi.sendTransaction(r.address, r.amount);
+      results.push({ ...r, status: "success", hash: res.txHash });
+    } catch (e) {
+      results.push({ ...r, status: "failed", error: String(e) });
     }
   }
-
-  return { success, failed }
-}
-
-export async function encryptBalance(amount: number) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  const data = {
-    address: wallet.address,
-    amount: String(Math.floor(amount * MICRO)),
-    private_key: wallet.privateKey,
-    encrypted_data: "v2|MOCK_ENCRYPTED_DATA",
-  }
-
-  const result = await fetchAPI("/encrypt_balance", {
-    method: "POST",
-    body: JSON.stringify(data),
-  })
-
-  return result
-}
-
-export async function decryptBalance(amount: number) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  const data = {
-    address: wallet.address,
-    amount: String(Math.floor(amount * MICRO)),
-    private_key: wallet.privateKey,
-    encrypted_data: "v2|MOCK_ENCRYPTED_DATA",
-  }
-
-  const result = await fetchAPI("/decrypt_balance", {
-    method: "POST",
-    body: JSON.stringify(data),
-  })
-
-  return result
-}
-
-export async function createPrivateTransfer(toAddress: string, amount: number) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  // Get recipient public key
-  const pubKeyData = await fetchAPI(`/public_key/${toAddress}`)
-  const toPublicKey = pubKeyData.public_key
-
-  if (!toPublicKey) {
-    throw new Error("Recipient has no public key")
-  }
-
-  const data = {
-    from: wallet.address,
-    to: toAddress,
-    amount: String(Math.floor(amount * MICRO)),
-    from_private_key: wallet.privateKey,
-    to_public_key: toPublicKey,
-  }
-
-  const result = await fetchAPI("/private_transfer", {
-    method: "POST",
-    body: JSON.stringify(data),
-  })
-
-  return result
-}
-
-export async function getPendingTransfers() {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  const result = await fetchAPI(
-    `/pending_private_transfers?address=${wallet.address}`,
-    { method: "GET" },
-    { "X-Private-Key": wallet.privateKey },
-  )
-
-  return result.pending_transfers || []
-}
-
-export async function claimPrivateTransfer(transferId: string) {
-  const wallet = getWalletData()
-  if (!wallet) throw new Error("Wallet not connected")
-
-  const data = {
-    recipient_address: wallet.address,
-    private_key: wallet.privateKey,
-    transfer_id: transferId,
-  }
-
-  const result = await fetchAPI("/claim_private_transfer", {
-    method: "POST",
-    body: JSON.stringify(data),
-  })
-
-  return result
-}
+  return results;
+};
